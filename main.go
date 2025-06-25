@@ -82,8 +82,13 @@ func readWrite(dbDir string, numEntries int) {
 			fmt.Printf("Error getting key %s: %v\n", key, err)
 		}
 	}
-	falsePositives := db.GetBloomFalsePositives()
-	fmt.Printf("%d entries read in %s, %d/%d correct, %d false positives\n\n", numEntries, time.Since(start), success, numEntries, falsePositives)
+	bloomFalsePositives := db.GetBloomFalsePositives()
+	hashIndexFalsePositives := db.GetHashIndexFalsePositives()
+	binarySearchMisses := db.GetBinarySearchMisses()
+	totalFalsePositives := bloomFalsePositives + hashIndexFalsePositives + binarySearchMisses
+	fmt.Printf("%d entries read in %s\n", numEntries, time.Since(start))
+	fmt.Printf("Bloom FP: %d, HH FP: %d, BS FP: %d\n", bloomFalsePositives, hashIndexFalsePositives, binarySearchMisses)
+	fmt.Printf("Total FP: %d\n", totalFalsePositives)
 }
 
 func main() {

@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/ortuman/nuke"
 )
 
 // IndexEntry represents a key's location within a data file.
@@ -27,14 +25,15 @@ type IndexEntry struct {
 
 // SSTable holds the metadata for a single Sorted String Table on disk.
 type SSTable struct {
-	ChunkID string
-	Index   []IndexEntry // nil for old tables that are not fully loaded
-	Bloom   *BloomFilter // Always present
+	ChunkID       string
+	Index         []IndexEntry // nil for old tables that are not fully loaded
+	Bloom         *BloomFilter // Always present
+	HashTable     []byte       // loaded hash table (nil for old tables)
+	HashTableSize int          // number of slots in hash table
 }
 
 // Config holds the configuration options for a DB instance.
 type Config struct {
-	MemtableCount    int // Number of memtables to keep in memory (1 active, N-1 immutable).
 	MaxMemTableSize  int // Max number of entries in a memtable before it's rotated.
 	MaxOpenFiles     int // Max number of open file handles in the LRU cache.
 	MaxCacheSize     int // Max number of key-value pairs in the LRU cache.
@@ -46,15 +45,12 @@ type Config struct {
 
 // MemTable is an in-memory table of key-value pairs.
 type MemTable struct {
-	arena    nuke.Arena
 	entries  map[string]string
 	keyOrder []string
 }
 
 func NewMemTable() *MemTable {
-	a := nuke.NewMonotonicArena(256*1024, 80) // 256KB buffer, 80MB max
 	return &MemTable{
-		arena:    a,
 		entries:  make(map[string]string),
 		keyOrder: make([]string, 0),
 	}
@@ -139,7 +135,7 @@ type DB struct {
 	mu         sync.RWMutex
 	dataDir    string
 	indexDir   string
-	memTables  []*MemTable
+	memTable   *MemTable
 	sstables   []SSTable
 	chunkCount int
 	config     Config
@@ -147,10 +143,11 @@ type DB struct {
 	openFiles  *cache.LRUCache // Using cache from package
 	lruCache   *cache.LRUCache // Using cache from package
 
-	bloomFalsePositives int64                   // Counter for Bloom filter false positives
-	batchLoadedIndexes  map[string][]IndexEntry // map from chunkID to loaded index (for batch)
-	batchArena          nuke.Arena              // arena for current batch
-	batchStartIdx       int                     // the starting index of the current batch
+	bloomFalsePositives     int64                   // Counter for Bloom filter false positives
+	batchLoadedIndexes      map[string][]IndexEntry // map from chunkID to loaded index (for batch)
+	batchStartIdx           int                     // the starting index of the current batch
+	binarySearchMisses      int64                   // Counter for binary search fallback after hash miss
+	hashIndexFalsePositives int64
 }
 
 // Open initializes a database instance.
@@ -165,8 +162,7 @@ func Open(baseDir string, config *Config) (*DB, error) {
 
 	if config == nil {
 		config = &Config{
-			MemtableCount:    1,
-			MaxMemTableSize:  32384,
+			MaxMemTableSize:  8192,
 			MaxOpenFiles:     256,
 			MaxCacheSize:     4096,
 			CacheLoadSize:    512,
@@ -179,7 +175,7 @@ func Open(baseDir string, config *Config) (*DB, error) {
 	db := &DB{
 		dataDir:            dataDir,
 		indexDir:           indexDir,
-		memTables:          []*MemTable{NewMemTable()},
+		memTable:           NewMemTable(),
 		sstables:           []SSTable{},
 		config:             *config,
 		openFiles:          cache.NewLRUCache(config.MaxOpenFiles), // Using cache from package
@@ -239,43 +235,36 @@ func Open(baseDir string, config *Config) (*DB, error) {
 
 func (db *DB) Put(key, value string) error {
 	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	activeTable := db.memTables[0]
-	if _, exists := activeTable.entries[key]; !exists {
-		activeTable.keyOrder = append(activeTable.keyOrder, key)
+	if _, exists := db.memTable.entries[key]; !exists {
+		db.memTable.keyOrder = append(db.memTable.keyOrder, key)
 	}
-	activeTable.entries[key] = value
+	db.memTable.entries[key] = value
 	db.lruCache.Put(key, value)
 
-	if len(activeTable.entries) >= db.config.MaxMemTableSize {
-		newActiveTable := NewMemTable()
-		db.memTables = append([]*MemTable{newActiveTable}, db.memTables...)
+	shouldFlush := len(db.memTable.entries) >= db.config.MaxMemTableSize
+	var toFlush *MemTable
+	if shouldFlush {
+		toFlush = db.memTable
+		db.memTable = NewMemTable()
+	}
+	db.mu.Unlock()
 
-		if len(db.memTables) > db.config.MemtableCount {
-			oldestTableIndex := len(db.memTables) - 1
-			tableToFlush := db.memTables[oldestTableIndex]
-			db.memTables = db.memTables[:oldestTableIndex]
-
-			db.flushWg.Add(1)
-			go func(mt *MemTable) {
-				defer db.flushWg.Done()
-				if err := db.flush(mt); err != nil {
-					fmt.Fprintf(os.Stderr, "error during background flush: %v\n", err)
-				}
-			}(tableToFlush)
+	if shouldFlush {
+		if err := db.flush(toFlush); err != nil {
+			fmt.Fprintf(os.Stderr, "error during flush: %v\n", err)
 		}
 	}
 	return nil
 }
 
 func (db *DB) flush(memTable *MemTable) error {
-	db.mu.Lock()
+	// All work that does not require locking
+	sort.Strings(memTable.keyOrder)
+
 	chunkID := fmt.Sprintf("sst-%010d", db.chunkCount)
+	db.mu.Lock()
 	db.chunkCount++
 	db.mu.Unlock()
-
-	sort.Strings(memTable.keyOrder)
 
 	dataPath := filepath.Join(db.dataDir, chunkID+".data.txt")
 	indexPath := filepath.Join(db.indexDir, chunkID+".index.txt")
@@ -298,26 +287,24 @@ func (db *DB) flush(memTable *MemTable) error {
 	bloom := NewBloomFilter(len(memTable.keyOrder), db.config.BloomBitsPerKey)
 	var offset uint64
 	var newIndex []IndexEntry
+	keyHashes := make([]uint64, 0, len(memTable.keyOrder))
 	for _, key := range memTable.keyOrder {
-		// Allocate key/value in arena
-		keyArena := nuke.New[string](memTable.arena)
-		*keyArena = key
-		valueArena := nuke.New[string](memTable.arena)
-		*valueArena = memTable.entries[key]
-		line := fmt.Sprintf("%s\t%s\n", *keyArena, *valueArena)
+		value := memTable.entries[key]
+		line := fmt.Sprintf("%s\t%s\n", key, value)
 		n, err := dataWriter.WriteString(line)
 		if err != nil {
 			return err
 		}
-		// no int conversion, just encode the offset directly as binary to base64
 		offsetBase64 := base64.StdEncoding.EncodeToString(binary.BigEndian.AppendUint64(nil, offset))
-		_, err = fmt.Fprintf(indexWriter, "%s\t%s\n", *keyArena, offsetBase64)
+		_, err = fmt.Fprintf(indexWriter, "%s\t%s\n", key, offsetBase64)
 		if err != nil {
 			return err
 		}
-		newIndex = append(newIndex, IndexEntry{Key: *keyArena, Offset: offset})
-		bloom.Add([]byte(*keyArena))
+		newIndex = append(newIndex, IndexEntry{Key: key, Offset: offset})
+		bloom.Add([]byte(key))
 		offset += uint64(n)
+		keyHash := fnvHash64([]byte(key))
+		keyHashes = append(keyHashes, keyHash)
 	}
 
 	if err := dataWriter.Flush(); err != nil {
@@ -327,7 +314,6 @@ func (db *DB) flush(memTable *MemTable) error {
 		return err
 	}
 
-	// Write bloom filter to disk
 	bloomFile, err := os.Create(bloomPath)
 	if err != nil {
 		return err
@@ -337,19 +323,48 @@ func (db *DB) flush(memTable *MemTable) error {
 		return err
 	}
 
-	db.mu.Lock()
-	// Decide if the new index should be loaded into memory or not
+	// Build and write hash table
+	tableSize := nextPowerOfTwo(len(memTable.keyOrder) * 2)
+	hashTable := make([]byte, tableSize*16)
+	for i := range memTable.keyOrder {
+		hash := keyHashes[i]
+		offset := newIndex[i].Offset
+		for j := 0; j < tableSize; j++ {
+			slot := (int(hash) + j) & (tableSize - 1)
+			pos := slot * 16
+			existing := binary.BigEndian.Uint64(hashTable[pos : pos+8])
+			if existing == 0 {
+				binary.BigEndian.PutUint64(hashTable[pos:pos+8], hash)
+				binary.BigEndian.PutUint64(hashTable[pos+8:pos+16], offset)
+				break
+			}
+		}
+	}
+	hashPath := filepath.Join(db.indexDir, chunkID+".index.hash.txt")
+	hashFile, err := os.Create(hashPath)
+	if err != nil {
+		return err
+	}
+	_, err = hashFile.Write(hashTable)
+	hashFile.Close()
+	if err != nil {
+		return err
+	}
+
+	// Only lock for critical section
 	var finalIndex []IndexEntry
+	var finalHashTable []byte
+	var finalHashTableSize int
 	if len(db.sstables) < db.config.MaxLoadedIndexes {
 		finalIndex = newIndex
+		finalHashTable = hashTable
+		finalHashTableSize = tableSize
 	}
-	db.sstables = append(db.sstables, SSTable{ChunkID: chunkID, Index: finalIndex, Bloom: bloom})
+	db.mu.Lock()
+	db.sstables = append(db.sstables, SSTable{ChunkID: chunkID, Index: finalIndex, Bloom: bloom, HashTable: finalHashTable, HashTableSize: finalHashTableSize})
 	sort.Slice(db.sstables, func(i, j int) bool {
 		return db.sstables[i].ChunkID < db.sstables[j].ChunkID
 	})
-	// Free the arena for this memtable
-	memTable.arena.Reset(true)
-	memTable.arena = nil
 	db.mu.Unlock()
 	return nil
 }
@@ -364,34 +379,39 @@ func (db *DB) Get(key string) (string, error) {
 
 	keyBytes := []byte(key)
 
-	for _, memTable := range db.memTables {
-		if val, ok := memTable.entries[key]; ok {
-			db.lruCache.Put(key, val)
-			return val, nil
-		}
-	}
-
 	for i := len(db.sstables) - 1; i >= 0; i-- {
 		sst := db.sstables[i]
 		if !sst.Bloom.Test(keyBytes) {
 			continue // Definitely not in this table.
 		}
-
 		var index []IndexEntry
+		var hashTable []byte
+		var hashTableSize int
 		var err error
 		if sst.Index != nil {
-			index = sst.Index // Use in-memory index
+			index = sst.Index
+			hashTable = sst.HashTable
+			hashTableSize = sst.HashTableSize
 		} else {
-			// Batch index loading logic with arena
 			if idxEntries, ok := db.batchLoadedIndexes[sst.ChunkID]; ok {
 				index = idxEntries
+				if sst.HashTable != nil {
+					hashTable = sst.HashTable
+					hashTableSize = sst.HashTableSize
+				} else {
+					hashPath := filepath.Join(db.indexDir, sst.ChunkID+".index.hash.txt")
+					hashFile, err := os.Open(hashPath)
+					if err == nil {
+						hashTable, _ = io.ReadAll(hashFile)
+						hashFile.Close()
+						hashTableSize = len(hashTable) / 16
+					}
+				}
 			} else {
-				// Need to load a new batch
 				batchSize := db.config.IndexLoadSize
 				if batchSize <= 0 {
 					batchSize = 4
 				}
-				// Find the position of this chunkID in db.sstables
 				pos := -1
 				for j := range db.sstables {
 					if db.sstables[j].ChunkID == sst.ChunkID {
@@ -402,34 +422,64 @@ func (db *DB) Get(key string) (string, error) {
 				if pos == -1 {
 					continue
 				}
-				// Evict previous batch and free its arena
-				if db.batchArena != nil {
-					db.batchArena.Reset(true)
-					db.batchArena = nil
-				}
 				db.batchLoadedIndexes = make(map[string][]IndexEntry)
 				db.batchStartIdx = pos
-				// Create a new arena for this batch
-				batchArena := nuke.NewMonotonicArena(256*1024, 80)
-				for j := pos; j < pos+batchSize && j < len(db.sstables); j++ {
-					cid := db.sstables[j].ChunkID
-					idx, err := db.loadIndexFromDiskArena(cid, batchArena)
-					if err == nil {
-						db.batchLoadedIndexes[cid] = idx
-					}
-				}
-				db.batchArena = batchArena
 				index = db.batchLoadedIndexes[sst.ChunkID]
 			}
 		}
 
+		// Try hash table lookup
+		if hashTable != nil && hashTableSize > 0 {
+			hash := fnvHash64(keyBytes)
+			found := false
+			var offset uint64
+			for j := 0; j < hashTableSize; j++ {
+				slot := (int(hash) + j) & (hashTableSize - 1)
+				pos := slot * 16
+				h := binary.BigEndian.Uint64(hashTable[pos : pos+8])
+				if h == 0 {
+					break // not found
+				}
+				if h == hash {
+					offset = binary.BigEndian.Uint64(hashTable[pos+8 : pos+16])
+					found = true
+					break
+				}
+			}
+			if found {
+				file, err := db.getFileHandle(sst.ChunkID)
+				if err != nil {
+					continue
+				}
+				_, err = file.Seek(int64(offset), 0)
+				if err != nil {
+					continue
+				}
+				line, err := bufio.NewReader(file).ReadString('\n')
+				if err != nil && err != io.EOF {
+					continue
+				}
+				parts := strings.SplitN(strings.TrimSpace(line), "\t", 2)
+				if len(parts) == 2 && parts[0] == key {
+					db.lruCache.Put(key, parts[1])
+					return parts[1], nil
+				}
+				// else: hash collision, fall through to binary search
+				db.hashIndexFalsePositives++
+				fmt.Fprintf(os.Stderr, "[DEBUG] Hash lookup for key '%s' in chunk '%s' failed: offset=%d, line='%s', parts=%v\n", key, sst.ChunkID, offset, line, parts)
+			}
+		}
+		// Fallback: binary search
 		idx := binarySearch(index, key)
 		if idx == -1 {
 			// Bloom filter gave a false positive
 			db.bloomFalsePositives++
+			// now continue with the next sstable
 			continue
 		}
-
+		if hashTable != nil && hashTableSize > 0 {
+			db.binarySearchMisses++
+		}
 		file, err := db.getFileHandle(sst.ChunkID)
 		if err != nil {
 			return "", err
@@ -490,62 +540,62 @@ func (db *DB) loadIndexFromDisk(chunkID string) ([]IndexEntry, error) {
 	return index, nil
 }
 
-func (db *DB) loadIndexFromDiskArena(chunkID string, a nuke.Arena) ([]IndexEntry, error) {
+func (db *DB) loadIndexFromDiskArena(chunkID string, _ interface{}) ([]IndexEntry, []byte, int, error) {
 	indexPath := filepath.Join(db.indexDir, chunkID+".index.txt")
+	hashPath := filepath.Join(db.indexDir, chunkID+".index.hash.txt")
 	f, err := os.Open(indexPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, err
 	}
 	fileBytes, err := io.ReadAll(f)
 	f.Close()
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, err
 	}
 	lines := bytes.Split(fileBytes, []byte("\n"))
-	index := nuke.MakeSlice[IndexEntry](a, 0, len(lines))
+	index := make([]IndexEntry, 0, len(lines))
 	for _, line := range lines {
 		if len(line) == 0 {
 			continue
 		}
 		parts := bytes.SplitN(line, []byte("\t"), 2)
 		if len(parts) == 2 {
-			keyPtr := nuke.New[string](a)
-			*keyPtr = string(parts[0])
+			key := string(parts[0])
 			offset, err := base64.StdEncoding.DecodeString(string(parts[1]))
 			if err != nil {
 				continue
 			}
 			offsetUInt64 := binary.BigEndian.Uint64(offset)
-			entry := nuke.New[IndexEntry](a)
-			entry.Key = *keyPtr
-			entry.Offset = offsetUInt64
-			index = nuke.SliceAppend(a, index, *entry)
+			index = append(index, IndexEntry{Key: key, Offset: offsetUInt64})
 		}
 	}
-	return index, nil
+	// Load hash table
+	hashFile, err := os.Open(hashPath)
+	if err != nil {
+		return index, nil, 0, nil // fallback: no hash table
+	}
+	hashTable, err := io.ReadAll(hashFile)
+	hashFile.Close()
+	if err != nil {
+		return index, nil, 0, nil
+	}
+	tableSize := len(hashTable) / 16
+	return index, hashTable, tableSize, nil
 }
 
 func (db *DB) Close() error {
 	db.mu.Lock()
-	for _, memTable := range db.memTables {
-		if len(memTable.entries) > 0 {
-			db.flushWg.Add(1)
-			go func(mt *MemTable) {
-				defer db.flushWg.Done()
-				db.flush(mt)
-			}(memTable)
+	memTable := db.memTable
+	db.memTable = nil
+	db.mu.Unlock()
+	if memTable != nil && len(memTable.entries) > 0 {
+		if err := db.flush(memTable); err != nil {
+			fmt.Fprintf(os.Stderr, "error during final flush: %v\n", err)
 		}
 	}
-	db.memTables = nil
-	db.mu.Unlock()
-	db.flushWg.Wait()
 	db.openFiles.Clear()
 	db.lruCache.Clear()
 	db.batchLoadedIndexes = nil
-	if db.batchArena != nil {
-		db.batchArena.Reset(true)
-		db.batchArena = nil
-	}
 	return nil
 }
 
@@ -594,4 +644,45 @@ func max(x, y int) int {
 // GetBloomFalsePositives returns the number of Bloom filter false positives (misses)
 func (db *DB) GetBloomFalsePositives() int64 {
 	return db.bloomFalsePositives
+}
+
+// GetBinarySearchMisses returns the number of binary search misses
+func (db *DB) GetBinarySearchMisses() int64 {
+	return db.binarySearchMisses
+}
+
+// GetHashIndexFalsePositives returns the number of hash index false positives
+func (db *DB) GetHashIndexFalsePositives() int64 {
+	return db.hashIndexFalsePositives
+}
+
+// Hash function
+func fnvHash64(data []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(data)
+	return h.Sum64()
+}
+
+// Utility: next power of two
+func nextPowerOfTwo(x int) int {
+	if x <= 0 {
+		return 1
+	}
+	x--
+	x |= x >> 1
+	x |= x >> 2
+	x |= x >> 4
+	x |= x >> 8
+	x |= x >> 16
+	if ^uint(0)>>32 != 0 {
+		x |= x >> 32
+	}
+	return x + 1
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

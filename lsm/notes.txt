@@ -1,0 +1,5 @@
+index the indexes as well for value key indexing
+add schema types. etc.
+for storing indexes, don't store in memory use sparse indexing,
+don't store per X keys instead store like skip list, exponential skip indexing.
+always use hash indexing to jump easily.
